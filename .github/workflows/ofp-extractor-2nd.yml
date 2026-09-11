@@ -148,6 +148,8 @@ jobs:
             exit 1
           fi
 
+          sudo apt-fast install -qqy clang
+
           git clone https://github.com/affggh/lpunpack_and_lpmake.git --depth=1
           cd lpunpack_and_lpmake
           bash make.sh
@@ -218,3 +220,4 @@ jobs:
             echo "Super images zip: ${SUPER_LINK:-'not generated'}"
           fi
           echo "-----------------------------------"
+          
