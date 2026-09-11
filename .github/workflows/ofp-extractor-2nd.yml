@@ -148,15 +148,10 @@ jobs:
             exit 1
           fi
 
-          sudo apt-fast install -qqy clang
-
-          git clone https://github.com/affggh/lpunpack_and_lpmake.git --depth=1
-          cd lpunpack_and_lpmake
-          bash make.sh
-          cd ..
+          git clone https://github.com/unix3dgforce/lpunpack.git --depth=1
 
           mkdir -p super_out
-          ./lpunpack_and_lpmake/lpunpack super/super.img super_out
+          python3 lpunpack/lpunpack.py super/super.img super_out
 
           if [ -z "$(find super_out -iname '*.img' -print -quit)" ]; then
             echo "Error: no partition images were extracted from super.img."
