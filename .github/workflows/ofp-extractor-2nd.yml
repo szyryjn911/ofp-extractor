@@ -22,7 +22,7 @@ on:
         required: false
         default: "NO"
       region:
-        description: "Region code for super merge (e.g. IN for India)"
+        description: "Preferred region code for super merge (e.g. IN, EX). If not found in this ROM's super_map.csv, it auto-falls back to the only/best available region."
         required: false
         default: "IN"
       bigfile:
@@ -132,18 +132,62 @@ jobs:
         if: ${{ github.event.inputs.simage == 'YES' }}
         shell: bash
         run: |
+          sudo apt-get install -y simg2img
           mkdir -p super
           cd out
-          echo "Files in out/ before merge:"
-          ls -la *super*.img 2>/dev/null || echo "(no files matching *super*.img found)"
-          curl -s https://gist.githubusercontent.com/ksauraj/50bea76ade411df498e108b045674f1d/raw/merge.sh -o merge.sh
-          bash -x merge.sh "$REGION"
-          echo "Files in out/ after merge:"
-          ls -la *super*.img 2>/dev/null || echo "(no files matching *super*.img found after merge)"
-          mv *super*img ../super/ 2>/dev/null || true
+
+          MAPFILE=$(find . -iname "super_map.csv" | head -n1)
+
+          if [ -z "$MAPFILE" ]; then
+            echo "No super_map.csv found - this ROM likely ships a single unsplit super.img already."
+            if [ -f super.img ]; then
+              cp super.img ../super/super.img
+              echo "Copied existing super.img as-is."
+            else
+              echo "Error: no super_map.csv and no super.img found in decrypted output."
+              exit 1
+            fi
+            cd ..
+            ls -la super/
+            exit 0
+          fi
+
+          echo "Found super_map.csv:"
+          cat "$MAPFILE"
+
+          # Column layout is: <code>,<region>,<file1>,<file2>,...
+          # Keep only rows whose region field looks like a real 2-5 letter code.
+          REGIONS=$(awk -F',' '$2 ~ /^[A-Za-z]{2,5}$/ {print toupper($2)}' "$MAPFILE" | sort -u)
+          echo "Available regions in this firmware: $(echo "$REGIONS" | tr '\n' ' ')"
+
+          REQUESTED=$(echo "$REGION" | tr '[:lower:]' '[:upper:]')
+          NUM_REGIONS=$(echo "$REGIONS" | wc -l)
+
+          if echo "$REGIONS" | grep -qx "$REQUESTED"; then
+            CHOSEN="$REQUESTED"
+            echo "Using requested region: $CHOSEN"
+          elif [ "$NUM_REGIONS" -eq 1 ]; then
+            CHOSEN=$(echo "$REGIONS" | head -n1)
+            echo "Requested region '$REQUESTED' not listed, but this firmware only has one region - auto-using: $CHOSEN"
+          else
+            CHOSEN=$(echo "$REGIONS" | grep -iE '^(EX|GL|WW|EU|GLOBAL)$' | head -n1)
+            if [ -z "$CHOSEN" ]; then
+              CHOSEN=$(echo "$REGIONS" | head -n1)
+            fi
+            echo "Requested region '$REQUESTED' was not found among: $(echo "$REGIONS" | tr '\n' ' ')"
+            echo "Auto-selected fallback region: $CHOSEN - re-run with 'region' set correctly if this is wrong."
+          fi
+
+          ROW=$(awk -F',' -v r="$CHOSEN" 'toupper($2)==r {print; exit}' "$MAPFILE")
+          echo "Selected row: $ROW"
+
+          FILES=$(echo "$ROW" | awk -F',' '{for(i=3;i<=NF;i++) printf "%s ", $i}')
+          echo "Files to merge: $FILES"
+
+          simg2img $FILES ../super/super.img
           cd ..
           echo "Result in super/:"
-          ls -la super/ 2>/dev/null || true
+          ls -la super/
 
       - name: Extract all partition images from merged super.img
         if: ${{ github.event.inputs.extract_super == 'YES' }}
