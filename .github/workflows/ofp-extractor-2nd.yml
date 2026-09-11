@@ -1,0 +1,220 @@
+name: Extract OFP from Stock ROM (Gofile Upload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_link:
+        description: "Direct link to the Stock ROM ZIP (contains the .ofp inside)"
+        required: true
+      filename:
+        description: "Output filename (make it unique, no spaces)"
+        required: true
+      devicetype:
+        description: "Chipset type: QC (Qualcomm) or MTK (MediaTek)"
+        required: false
+        default: "MTK"
+      simage:
+        description: "Merge super.img partitions? YES or NO"
+        required: false
+        default: "YES"
+      extract_super:
+        description: "Extract all partition images (system, vendor, product, etc.) from the merged super.img? YES or NO. If YES, super.img itself is NOT uploaded/linked - only the extracted images are."
+        required: false
+        default: "NO"
+      region:
+        description: "Region code for super merge (e.g. IN for India)"
+        required: false
+        default: "IN"
+      bigfile:
+        description: "Set YES if the ROM zip is larger than 6-8GB (frees extra runner disk space, slower)"
+        required: false
+        default: "NO"
+
+env:
+  ROM_LINK: ${{ github.event.inputs.rom_link }}
+  FILENAME: ${{ github.event.inputs.filename }}
+  DTYPE: ${{ github.event.inputs.devicetype }}
+  SIMG: ${{ github.event.inputs.simage }}
+  EXTRACT_SUPER: ${{ github.event.inputs.extract_super }}
+  BFILE: ${{ github.event.inputs.bigfile }}
+  REGION: ${{ github.event.inputs.region }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Free up runner disk space (big ROM zips)
+        if: ${{ github.event.inputs.bigfile == 'YES' }}
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Install base tools
+        shell: bash
+        run: |
+          sudo add-apt-repository ppa:apt-fast/stable
+          sudo apt-get -y install apt-fast
+          sudo apt-fast update -qqy
+          sudo apt-fast install -qqy coreutils p7zip-full p7zip-rar python3 python3-pip \
+            aria2 unzip jq openssl rsync simg2img
+
+      - name: Resolve real download URL (handles MediaFire page links)
+        shell: bash
+        run: |
+          LINK="$ROM_LINK"
+          if [[ "$LINK" == *"mediafire.com"* ]]; then
+            echo "MediaFire link detected, resolving direct CDN URL..."
+            PAGE=$(curl -sL "$LINK")
+            DIRECT=$(echo "$PAGE" | grep -oE 'https://download[0-9]*\.mediafire\.com/[^"]+' | head -n1)
+            if [ -z "$DIRECT" ]; then
+              echo "Error: Could not resolve MediaFire direct link. The link may be dead or region-blocked."
+              exit 1
+            fi
+            LINK="$DIRECT"
+            echo "Resolved: $LINK"
+          fi
+          echo "REAL_LINK=$LINK" >> ${GITHUB_ENV}
+
+      - name: Download the Stock ROM ZIP
+        shell: bash
+        run: |
+          aria2c -c -s16 -x16 "$REAL_LINK" -o rom_download.zip 2>/dev/null || {
+            echo "Error: The provided ROM link is invalid or unreachable." && exit 1
+          }
+
+      - name: Unzip ROM and locate the .ofp file
+        shell: bash
+        run: |
+          mkdir -p rom_extract
+          # Try zip first, fall back to 7z for exotic archive formats
+          unzip -q rom_download.zip -d rom_extract 2>/dev/null || 7z x rom_download.zip -orom_extract -y
+          rm -f rom_download.zip
+
+          OFP_PATH=$(find rom_extract -iname "*.ofp" | head -n1)
+          if [ -z "$OFP_PATH" ]; then
+            echo "Error: No .ofp file was found inside the ROM zip."
+            find rom_extract -maxdepth 2
+            exit 1
+          fi
+
+          mv "$OFP_PATH" ./firmware.ofp
+          rm -rf rom_extract
+          echo "OFP_FILE=firmware.ofp" >> ${GITHUB_ENV}
+
+      - name: Decrypt the OFP firmware
+        shell: bash
+        run: |
+          sudo apt-fast -y install python3-testresources
+          sudo pip3 install --upgrade pip wheel setuptools
+          sudo pip3 install pycryptodome
+          git clone https://github.com/bkerler/oppo_decrypt.git --depth=1
+          cd oppo_decrypt
+          pip3 install -r requirements.txt
+          cd ..
+
+          dtype=$DTYPE
+          mkdir -p out
+          if [ "$dtype" == "QC" ]; then
+            echo "Decrypting Qualcomm OFP..."
+            python3 ./oppo_decrypt/ofp_qc_decrypt.py "$OFP_FILE" out
+          elif [ "$dtype" == "MTK" ]; then
+            echo "Decrypting MediaTek OFP..."
+            python3 ./oppo_decrypt/ofp_mtk_decrypt.py "$OFP_FILE" out
+          else
+            echo "Error: Invalid device type provided (use QC or MTK)."
+            exit 1
+          fi
+          rm -f "$OFP_FILE"
+
+      - name: Combine super partition images
+        if: ${{ github.event.inputs.simage == 'YES' }}
+        shell: bash
+        run: |
+          mkdir -p super
+          cd out
+          curl -s https://gist.githubusercontent.com/ksauraj/50bea76ade411df498e108b045674f1d/raw/merge.sh -o merge.sh
+          bash merge.sh "$REGION"
+          mv *super*img ../super/ 2>/dev/null || true
+          cd ..
+
+      - name: Extract all partition images from merged super.img
+        if: ${{ github.event.inputs.extract_super == 'YES' }}
+        shell: bash
+        run: |
+          if [ ! -f super/super.img ]; then
+            echo "Error: super.img not found. 'Extract super.img' requires 'Merge super.img partitions?' to also be YES."
+            exit 1
+          fi
+
+          git clone https://github.com/affggh/lpunpack_and_lpmake.git --depth=1
+          cd lpunpack_and_lpmake
+          bash make.sh
+          cd ..
+
+          mkdir -p super_out
+          ./lpunpack_and_lpmake/lpunpack super/super.img super_out
+
+          if [ -z "$(find super_out -iname '*.img' -print -quit)" ]; then
+            echo "Error: no partition images were extracted from super.img."
+            exit 1
+          fi
+
+      - name: Compress extracted files
+        shell: bash
+        run: |
+          cd out && zip -r9 "../Decrypted_${FILENAME}.zip" . -x "super.img" && cd ..
+          if [ "$EXTRACT_SUPER" == "YES" ] && [ -d super_out ]; then
+            cd super_out && zip -r9 "../extractedimgs_${FILENAME}.zip" *.img && cd ..
+          elif [ "$SIMG" == "YES" ] && [ -f super/super.img ]; then
+            cd super && zip -r9 "../superimages_${FILENAME}.zip" super.img && cd ..
+          fi
+
+      - name: Upload result to Gofile
+        shell: bash
+        run: |
+          upload_file() {
+            local filepath="$1"
+            curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@${filepath}"
+          }
+
+          D_FILE="Decrypted_${FILENAME}.zip"
+          echo "Uploading ${D_FILE} to Gofile (this can take a while for multi-GB files)..."
+          resp=$(upload_file "$D_FILE")
+          status=$(echo "$resp" | jq -r '.status')
+          if [ "$status" != "ok" ]; then
+            echo "Gofile upload failed: $resp"
+            exit 1
+          fi
+          echo "FILE_LINK=$(echo "$resp" | jq -r '.data.downloadPage')" >> ${GITHUB_ENV}
+
+          if [ "$EXTRACT_SUPER" == "YES" ] && [ -f "extractedimgs_${FILENAME}.zip" ]; then
+            resp2=$(upload_file "extractedimgs_${FILENAME}.zip")
+            status2=$(echo "$resp2" | jq -r '.status')
+            if [ "$status2" == "ok" ]; then
+              echo "EXTRACTED_LINK=$(echo "$resp2" | jq -r '.data.downloadPage')" >> ${GITHUB_ENV}
+            else
+              echo "Extracted images upload failed: $resp2"
+            fi
+          elif [ "$SIMG" == "YES" ] && [ -f "superimages_${FILENAME}.zip" ]; then
+            resp2=$(upload_file "superimages_${FILENAME}.zip")
+            status2=$(echo "$resp2" | jq -r '.status')
+            if [ "$status2" == "ok" ]; then
+              echo "SUPER_LINK=$(echo "$resp2" | jq -r '.data.downloadPage')" >> ${GITHUB_ENV}
+            else
+              echo "Super images upload failed: $resp2"
+            fi
+          fi
+
+      - name: Print download links
+        shell: bash
+        run: |
+          echo "-----------------------------------"
+          echo "Decrypted firmware zip: ${FILE_LINK}"
+          if [ "$EXTRACT_SUPER" == "YES" ]; then
+            echo "Extracted images zip (from super.img): ${EXTRACTED_LINK:-'not generated'}"
+          elif [ "$SIMG" == "YES" ]; then
+            echo "Super images zip: ${SUPER_LINK:-'not generated'}"
+          fi
+          echo "-----------------------------------"
