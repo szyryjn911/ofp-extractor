@@ -134,10 +134,16 @@ jobs:
         run: |
           mkdir -p super
           cd out
+          echo "Files in out/ before merge:"
+          ls -la *super*.img 2>/dev/null || echo "(no files matching *super*.img found)"
           curl -s https://gist.githubusercontent.com/ksauraj/50bea76ade411df498e108b045674f1d/raw/merge.sh -o merge.sh
-          bash merge.sh "$REGION"
+          bash -x merge.sh "$REGION"
+          echo "Files in out/ after merge:"
+          ls -la *super*.img 2>/dev/null || echo "(no files matching *super*.img found after merge)"
           mv *super*img ../super/ 2>/dev/null || true
           cd ..
+          echo "Result in super/:"
+          ls -la super/ 2>/dev/null || true
 
       - name: Extract all partition images from merged super.img
         if: ${{ github.event.inputs.extract_super == 'YES' }}
@@ -145,6 +151,15 @@ jobs:
         run: |
           if [ ! -f super/super.img ]; then
             echo "Error: super.img not found. 'Extract super.img' requires 'Merge super.img partitions?' to also be YES."
+            exit 1
+          fi
+
+          SUPER_SIZE=$(stat -c%s super/super.img)
+          echo "super.img size: ${SUPER_SIZE} bytes"
+          if [ "$SUPER_SIZE" -lt 1048576 ]; then
+            echo "Error: super.img is only ${SUPER_SIZE} bytes - the merge step did not produce a real image."
+            echo "This usually means the 'region' input didn't match an entry for this ROM's super_map.csv."
+            echo "Check the 'Combine super partition images' step's log to see what merge.sh reported, and confirm the region code."
             exit 1
           fi
 
